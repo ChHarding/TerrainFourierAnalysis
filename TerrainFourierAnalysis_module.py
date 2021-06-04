@@ -5,10 +5,34 @@ from math import ceil, log, sqrt
 from scipy.signal import lfilter, correlate
 from scipy.stats.distributions import chi2
 import matplotlib.pyplot as plt
+from io import StringIO
 
 np.set_printoptions(suppress="True") # no scientific notation BS!
 
 # TODO/Idea: taper each profile and glue together instead of averaging
+
+def array_from_file_german(fname, seperator=",", has_header=True):
+    ''' opens file, converts it, creates a dataframe, removes header if present and creates a 2D numpy array.
+        Jun 4, 2021: turns out Jaqueline's profiles have a header, are tab separated with comma as decimal
+        points (german mode)
+    '''
+    with open(fname) as fp:
+        s = fp.read()
+
+        # Convert german commas to dots
+        s = s.replace(",", ".")
+
+        data_stream = StringIO(s)
+        num_hd_rows = 1 if has_header == True else 0
+        df = pd.read_csv(data_stream, sep=seperator, header=num_hd_rows) 
+
+        print(df)
+
+        ar2d = df.to_numpy()
+        return ar2d
+
+    print("bad file", fname)
+    return None
 
 def avg_amplitude(ar2D):
     '''Average amplitude (and sample distances) of multiple profiles 
@@ -104,7 +128,11 @@ def remove_trend(x_lst, y_lst, fname, deg,  plot=False):
     if plot:
         fig1 = plt.figure(figsize=(10, 5))
         ax1 = plt.subplot(label="residuals") # to silence depreciation warning 
-        plt.title(fname + ": Profiles (top) and their de-trended residuals (bottom)")                                                                                          
+        plt.title(fname + f": Profiles (top) and order {deg} trend removed residuals (bottom)")  
+        max_x = int(x_lst[0][-1])
+        ticks = range(0, max_x, 50)
+        for t in ticks:
+            ax1.axvline(t, color='grey', lw=0.2) # plot vertical line that connects top and bottom tick                                                                                        
         colors = ["r", "c", "m", "y", "k", "b", "g"] * 10
     res_lst = [] # list of residuals
     var_cap_lst = [] # captured variance
@@ -127,6 +155,7 @@ def remove_trend(x_lst, y_lst, fname, deg,  plot=False):
         res_lst.append(res)
         
     if plot: 
+        ax1.set_xlim(0, max_x) # along-profile distance
         ax1.legend()
         plt.show()
     return res_lst, var_cap_lst
@@ -226,7 +255,7 @@ def fft1d_theor_signif(P,f, x,y, siglvl, smoothwin):
             # the mark if the spectrum is smoothed over a larger number of
             # frequencies--that is, the fraction of the spectrum that exceeds,
             # e.g., the 0.05 significance level will be closer to 0.05.
-    chisquare = chi2.ppf(0.95, df=dof) / dof # Note: Not using the Torrence & Compo 1998 routines from matlab
+    chisquare = chi2.ppf(siglvl, df=dof) / dof # Note: Not using the Torrence & Compo 1998 routines from matlab
     signif = fft_theor_sc * chisquare #Eqn(18) in Torrence & Compo 1998
 
     return fft_theor_sc, signif 
@@ -234,21 +263,110 @@ def fft1d_theor_signif(P,f, x,y, siglvl, smoothwin):
 # tests
 if __name__ == "__main__":\
 
-    filename = 'S09_5p.txt'
+    filename = '2.txt'
 
-    # read in tab separated txt file, no header
-    df = pd.read_csv(filename, sep="\t", header=None) # tab separated txt file
-    print(filename, ":", len(df), "samples,", len(list(df)) // 2, "profiles")
-    ar2D = df.to_numpy()
-
+    # make numpy array from file with profiles
+    ar2D = array_from_file_german(filename, seperator="\t", has_header=True)
+ 
     # put x and y columns into lists 
     x_lst, y_lst = get_profiles(ar2D)
 
     # plot trends
     x, y = avg_amplitude(ar2D) # averages profiles into a single profile
     trend_list = [1, 2, 3] 
-    plot_trends(x, y, trend_list, filename);
+    #plot_trends(x, y, trend_list, filename);
     
-    # De-trend and store residuals for each profile. 
-    res_lst, var_last = remove_trend(x_lst, y_lst, filename, deg=3, plot=True)
+    # De-trend and store residuals for each profile.
+    trend = 2 
+    res_lst, var_last = remove_trend(x_lst, y_lst, filename, deg=trend, plot=True)
 
+    # Create data for periodogram, base lines and significance lines for each residual (of an individual profile)                   
+    P_lst = []
+    signif_lst = []
+    theor_lst = []
+
+    smoothwin=1  # moving window for smoothing, 1 means no smoothing (leave at 1 as I don't fully understand the impact of smoothing ...)
+    siglvl = 0.95 # significance level
+
+    # loop over pairs of x (sample distances) and y (residuals), each from a profile
+    for x, y in zip(x_lst, res_lst):
+        P, f = fft1d_pgram(x, y, smoothwin) # returns Periodogram (y-axis) and frequency bins (x-axis)
+        P_lst.append(P) # collect P for this residual only as f will always be the same
+
+        fft_theor, fft_signif = fft1d_theor_signif(P,f, x,y, siglvl, smoothwin)
+        P_bt_signif = P[P > fft_signif] # number of elements in P that are larger that their corresponding significance
+        sig_frac = len(P_bt_signif)/len(P) # fraction of significant Ps
+        signif_lst.append(fft_signif)
+        theor_lst.append(fft_theor)  
+
+    # From the results with the individual profiles (above), average the pgrams, baselines and the significance lines 
+    P_avg = sum(P_lst)/len(P_lst)
+    theor_avg = sum(theor_lst) / len(theor_lst)  # red noise baseline
+    signif_avg = sum(signif_lst) / len(signif_lst)
+
+    # Plot pgrams
+
+    #import seaborn as sns
+    #sns.set_style("darkgrid") #use a preset template
+    
+    fig = plt.figure(figsize=(12,6)) # paper is 12 inches wide and 6 inches high.
+    ax = plt.subplot(label="pgrams") # handle for axis 
+    plt.title(filename, pad=15, y=None) # None means auto y position
+    
+
+    # Plot avg. pgram and helper lines
+    wl = 1/f # wavelength
+    plt.plot(wl,P_avg, color="Black", lw=1.5,  label='avg. Periodogram') # lw: line width
+    plt.plot(wl,theor_avg, color="red", lw=0.5, ls=":",  label='red-noise baseline') # dotted
+    plt.plot(wl,signif_avg, color="red", lw=0.5, ls="--", label=f"{siglvl}% significance") # dashed
+    ax.legend() # show a legend (default: upper left)
+
+    # Plot individual pgrams with rotating (random?) colors
+    for P in P_lst: 
+        plt.plot(wl,P, lw=0.3)
+
+    
+
+    # make x ticks at top and bottom (could be in log10!)
+    # lists must be custom tailored for the length of the profile!
+    ticks_top = list(range(20, 101, 20)) + [125] + list(range(150, 500, 50)) + list(range(500, 1001, 100))
+    for t in ticks_top:
+        ax.axvline(t, color='grey', lw=0.2) # plot vertical line that connects top and bottom tick
+        trans = ax.get_xaxis_transform()
+        plt.text(t, 1.01, # make small gap between labels and the top line
+                    str(t),
+                    #color='grey', 
+                    size=10,
+                    horizontalalignment='center',
+                    transform=trans)
+
+    # for bottom use same as ticks_top but w/o 125 b/c that freaks out the log 10 based labels
+    ticks_bot = list(range(20, 101, 20)) + list(range(150, 500, 50)) + list(range(500, 1001, 100)) 
+    plt.xticks(fontsize=10)
+    ax.tick_params(which="minor", length=4, width=2)
+    ax.tick_params( which="major", length=6, width=2, pad=0.5)
+    ax.set_xticks(ticks_bot)
+
+    # text info (lower right corner)
+    textstr = f"trendorder removed: {trend}\n{len(x)} samples, {(len(f)+1)*2} bins\nsmoothing window: {smoothwin}"
+    ax.text(0.99, 0.01, textstr, transform=ax.transAxes, 
+                    fontsize=8,
+                    horizontalalignment='right',
+                    verticalalignment='bottom')
+
+    # configure axis
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+
+    # limit view to what's relevant (depends heavily on your profiles!)
+    ax.set_xlim(20, 1000) # along-profile distance
+    ax.set_ylim(1e-5, 1e2) # amplitude, in log10
+
+    # Label axis
+    ax.set_ylabel("Mean squared amplitude ($m^2$)")
+    ax.set_xlabel("Frequency (1/m)")
+
+    plt.show() # show() is not needed with jupyter
+
+    # save to pdf and show in viewer
+    plt.savefig("pgram_" + filename + ".pdf")
